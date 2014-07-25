@@ -12,5 +12,5 @@ include_directories(${PugiXML_INCLUDE_DIR})
 
 set(CMAKE_CXX_FLAGS "-g3 -gdwarf-3 -Wall -Wextra -Werror -Wstrict-aliasing -std=c++11 -pedantic")
 
-add_executable(kdbx src/kdbx.cpp src/hashbuf.cpp)
+add_executable(kdbx src/kdbx.cpp src/group.cpp src/entry.cpp src/hashbuf.cpp)
 target_link_libraries(kdbx ${CRYPTOPP_LIBRARIES} ${PugiXML_LIBRARY})

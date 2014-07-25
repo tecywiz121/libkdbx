@@ -1,10 +1,10 @@
+#include "kdbx.hpp"
+
 #include <iostream>
 #include <sstream>
 #include <fstream>
 #include <cstring>
-#include "kdbx.hpp"
-#include "io.hpp"
-#include "hashbuf.hpp"
+#include <unordered_map>
 
 #include "cryptopp/aes.h"
 #include "cryptopp/ccm.h"
@@ -12,6 +12,11 @@
 #include "cryptopp/files.h"
 
 #include "pugixml.hpp"
+
+#include "future.hpp"
+
+#include "io.hpp"
+#include "hashbuf.hpp"
 
 using pugi::xml_document;
 using pugi::xml_node;
@@ -24,6 +29,7 @@ using std::endl;
 using std::ifstream;
 using std::istream;
 using std::unordered_map;
+using std::vector;
 
 using CryptoPP::SecByteBlock;
 using CryptoPP::SHA256;
@@ -46,6 +52,14 @@ int main(int argc, char** argv)
     kdbx::kdbx2 db;
     db.push_key("test123");
     db.load(input);
+
+    for (const kdbx::group& g : db.groups()) {
+        cout << g.uuid() << endl;
+        for (const kdbx::entry& e : g.entries()) {
+            cout << "\t" << e.uuid() << " " << e.get_string("UserName") << endl;
+        }
+    }
+
 #if 0
     cout << "Signature: " << db.signature1() << ", " << db.signature2() << endl;
     cout << "File Version: " << db.file_version() << endl;
@@ -58,6 +72,72 @@ int main(int argc, char** argv)
 
 namespace kdbx
 {
+
+class kdbx2_pvt
+{
+private:
+    kdbx2& _pub;
+
+public:
+    kdbx2_pvt(kdbx2& pub) : _pub(pub) {}
+
+    //
+    // Header
+    //
+    const uint32_t SIGNATURE[2] = {0x9AA2D903, 0xB54BFB67};
+
+    enum FieldID
+    {
+        END_OF_HEADER = 0,
+        COMMENT,
+        CIPHER_ID,
+        COMPRESSION_FLAGS,
+        MASTER_SEED,
+        TRANSFORM_SEED,
+        TRANSFORM_ROUNDS,
+        ENCRYPTION_IV,
+        PROTECTED_STREAM_KEY,
+        STREAM_START_BYTES,
+        INNER_RANDOM_STREAM_ID,
+    };
+
+
+    uint32_t signature1;
+    uint32_t signature2;
+    uint32_t file_version;
+
+    std::string comment;
+    std::string cipher_id;
+    uint32_t compression_flags;
+    CryptoPP::SecByteBlock master_seed;
+    CryptoPP::SecByteBlock transform_seed;
+    uint64_t transform_rounds;
+    CryptoPP::SecByteBlock encryption_iv;
+    CryptoPP::SecByteBlock protected_stream_key;
+    CryptoPP::SecByteBlock stream_start_bytes;
+    uint32_t inner_random_stream_id;
+
+
+    CryptoPP::SHA256 keys;
+
+    void parse_signature(std::istream& in);
+    void parse_fields(std::istream& in);
+    void parse_fields_v1(std::istream& in);
+
+    void parse_body(std::istream& in);
+    void parse_body_v1(std::istream& in);
+
+    //
+    // Groups
+    //
+    vector<group> groups;
+
+    //
+    // XML
+    //
+    xml_document document;
+    xml_node meta;
+};
 
 static bool starts_with(const string& str, const SecByteBlock& prefix)
 {
@@ -72,70 +152,56 @@ static bool starts_with(const string& str, const SecByteBlock& prefix)
     return !memcmp(str.data(), prefix.data(), prefix.size());
 }
 
-const unordered_map<string, void (kdbx2::*)(const char*)> kdbx2::_meta_setters = {
-    {string("Generator"), &kdbx2::generator},
-    {string("HeaderHash"), &kdbx2::header_hash},
-    {string("DatabaseName"), &kdbx2::database_name},
-    {string("DatabaseNameChanged"), &kdbx2::database_name_changed},
-    {string("DatabaseDescription"), &kdbx2::database_description},
-    {string("DatabaseDescriptionChanged"), &kdbx2::database_description_changed},
-    {string("DefaultUserName"), &kdbx2::default_user_name},
-    {string("DefaultUserNameChanged"), &kdbx2::default_user_name_changed},
-    {string("MaintenanceHistoryDays"), &kdbx2::maintenance_history_days},
-    {string("Color"), &kdbx2::color},
-    {string("MasterKeyChanged"), &kdbx2::master_key_changed},
-    {string("MasterKeyChangeRec"), &kdbx2::master_key_change_rec},
-    {string("MasterKeyChangeForce"), &kdbx2::master_key_change_force},
-    {string("RecycleBinEnabled"), &kdbx2::recycle_bin_enabled},
-    {string("RecycleBinUUID"), &kdbx2::recycle_bin_uuid},
-    {string("RecycleBinChanged"), &kdbx2::recycle_bin_changed},
-    {string("EntryTemplatesGroup"), &kdbx2::entry_templates_group},
-    {string("EntryTemplatesGroupChanged"), &kdbx2::entry_templates_group_changed},
-    {string("HistoryMaxItems"), &kdbx2::history_max_items},
-    {string("HistoryMaxSize"), &kdbx2::history_max_size},
-    {string("LastSelectedGroup"), &kdbx2::last_selected_group},
-    {string("LastTopVisibleGroup"), &kdbx2::last_top_visible_group},
-};
+kdbx2::kdbx2()
+    : _pvt(std::make_unique<kdbx2_pvt>(*this))
+{
+
+}
+
+kdbx2::~kdbx2()
+{
+
+}
 
 void kdbx2::push_key(const string& key)
 {
     SecByteBlock hash(SHA256::DIGESTSIZE);
     SHA256().CalculateDigest(hash.data(), reinterpret_cast<const byte*>(key.data()), key.size());
-    _keys.Update(hash.data(), hash.size());
+    _pvt->keys.Update(hash.data(), hash.size());
 }
 
 void kdbx2::clear_keys()
 {
-    _keys.Restart();
+    _pvt->keys.Restart();
 }
 
 void kdbx2::load(istream& in)
 {
-    parse_signature(in);
+    _pvt->parse_signature(in);
 
     // Read the file version
-    read(in, _file_version);
+    read(in, _pvt->file_version);
 
-    parse_fields(in);
-    parse_body(in);
+    _pvt->parse_fields(in);
+    _pvt->parse_body(in);
 }
 
-void kdbx2::parse_signature(istream& in)
+void kdbx2_pvt::parse_signature(istream& in)
 {
-    read(in, _signature1);
-    if (_signature1 != SIGNATURE[0]) {
+    read(in, signature1);
+    if (signature1 != SIGNATURE[0]) {
         throw parse_error("invalid signature (0)");
     }
 
-    read(in, _signature2);
-    if (_signature2 != SIGNATURE[1]) {
+    read(in, signature2);
+    if (signature2 != SIGNATURE[1]) {
         throw parse_error("invalid signature (1)");
     }
 }
 
-void kdbx2::parse_fields(istream& in)
+void kdbx2_pvt::parse_fields(istream& in)
 {
-    switch (file_version_major()) {
+    switch (_pub.file_version_major()) {
         case 0x01:
         case 0x02:
         case 0x03:
@@ -147,9 +213,9 @@ void kdbx2::parse_fields(istream& in)
     }
 }
 
-void kdbx2::parse_body(istream& in)
+void kdbx2_pvt::parse_body(istream& in)
 {
-    switch (file_version_major()) {
+    switch (_pub.file_version_major()) {
         case 0x01:
         case 0x02:
         case 0x03:
@@ -161,7 +227,7 @@ void kdbx2::parse_body(istream& in)
     }
 }
 
-void kdbx2::parse_fields_v1(istream& in)
+void kdbx2_pvt::parse_fields_v1(istream& in)
 {
     /*
      * The format for each field is pretty much:
@@ -186,58 +252,58 @@ void kdbx2::parse_fields_v1(istream& in)
                 return;
 
             case FieldID::COMMENT:
-                read(in, _comment, length);
+                read(in, comment, length);
                 break;
 
             case FieldID::CIPHER_ID:
-                read(in, _cipher_id, length);
+                read(in, cipher_id, length);
                 break;
 
             case FieldID::COMPRESSION_FLAGS:
-                if (length != sizeof(_compression_flags)) {
+                if (length != sizeof(compression_flags)) {
                     throw parse_error("compression flags format unknown");
                 }
-                read(in, _compression_flags);
+                read(in, compression_flags);
                 break;
 
             case FieldID::MASTER_SEED:
                 if (length != 32) {
                     throw parse_error("master seed unknown format");
                 }
-                read(in, _master_seed, length);
+                read(in, master_seed, length);
                 break;
 
             case FieldID::TRANSFORM_SEED:
                 if (length != 32) {
                     throw parse_error("transform seed unknown format");
                 }
-                read(in, _transform_seed, length);
+                read(in, transform_seed, length);
                 break;
 
             case FieldID::TRANSFORM_ROUNDS:
-                if (length != sizeof(_transform_rounds)) {
+                if (length != sizeof(transform_rounds)) {
                     throw parse_error("transform rounds unknown format");
                 }
-                read(in, _transform_rounds);
+                read(in, transform_rounds);
                 break;
 
             case FieldID::ENCRYPTION_IV:
-                read(in, _encryption_iv, length);
+                read(in, encryption_iv, length);
                 break;
 
             case FieldID::PROTECTED_STREAM_KEY:
-                read(in, _protected_stream_key, length);
+                read(in, protected_stream_key, length);
                 break;
 
             case FieldID::STREAM_START_BYTES:
-                read(in, _stream_start_bytes, length);
+                read(in, stream_start_bytes, length);
                 break;
 
             case FieldID::INNER_RANDOM_STREAM_ID:
-                if (length != sizeof(_inner_random_stream_id)) {
+                if (length != sizeof(inner_random_stream_id)) {
                     throw parse_error("inner random stream id unknown format");
                 }
-                read(in, _inner_random_stream_id);
+                read(in, inner_random_stream_id);
                 break;
 
             default:
@@ -246,17 +312,17 @@ void kdbx2::parse_fields_v1(istream& in)
     }
 }
 
-void kdbx2::parse_body_v1(istream& in)
+void kdbx2_pvt::parse_body_v1(istream& in)
 {
     // Build the master key
-    SecByteBlock master_key(_keys.DigestSize());
-    _keys.Final(master_key.data());
+    SecByteBlock master_key(keys.DigestSize());
+    keys.Final(master_key.data());
 
     // Encrypt the key _transform_rounds times
-    ECB_Mode<AES>::Encryption key_transform(_transform_seed,
-                                            _transform_seed.size());
+    ECB_Mode<AES>::Encryption key_transform(transform_seed,
+                                            transform_seed.size());
 
-    for (uint64_t ii = 0; ii < _transform_rounds; ii++) {
+    for (uint64_t ii = 0; ii < transform_rounds; ii++) {
         key_transform.ProcessData(master_key.data(),
                                     master_key.data(),
                                     master_key.size());
@@ -268,13 +334,13 @@ void kdbx2::parse_body_v1(istream& in)
     hash.Final(master_key.data());
 
     // Combine the key with the master seed
-    hash.Update(_master_seed.data(), _master_seed.size());
+    hash.Update(master_seed.data(), master_seed.size());
     hash.Update(master_key.data(), master_key.size());
     hash.Final(master_key.data());
 
     CBC_Mode<AES>::Decryption decryption(master_key,
                                             master_key.size(),
-                                            _encryption_iv.data());
+                                            encryption_iv.data());
 
     string ciphertext;
     read_to_end(in, ciphertext);
@@ -286,18 +352,18 @@ void kdbx2::parse_body_v1(istream& in)
         ) // StreamTransformationFilter
     ); // StringSource
 
-    if (!starts_with(plaintext, _stream_start_bytes)) {
+    if (!starts_with(plaintext, stream_start_bytes)) {
         throw parse_error("incorrect password");
     }
 
-    plaintext = plaintext.substr(_stream_start_bytes.size());
+    plaintext = plaintext.substr(stream_start_bytes.size());
 
     // Read the plaintext using a validating stream buffer
     stringstream ss(plaintext);
     hashbuf buffer(ss);
     istream hash_stream(&buffer);
 
-    xml_document doc;
+    xml_document& doc = document;
     xml_parse_result result = doc.load(hash_stream);
 
     if (!result) {
@@ -308,20 +374,65 @@ void kdbx2::parse_body_v1(istream& in)
     xml_node kee = doc.child("KeePassFile");
 
     // Read the Meta tag
-    xml_node meta = kee.child("Meta");
-
-    for (xml_node child : meta) {
-        try {
-            (this->*_meta_setters.at(child.name()))(child.text().as_string());
-        } catch (std::out_of_range& e) {
-            // TODO: Print a warning or something
-            std::cerr << "Unknown meta node: " << child.name() << endl;
-        }
-    }
+    meta = kee.child("Meta");
 
     // Read the Root tag
     xml_node root = kee.child("Root");
-    root.children();
+
+    for (xml_node child : root) {
+        if (!std::strcmp(child.name(), "Group")) {
+            groups.emplace_back(_pub, child);
+        } else if (!std::strcmp(child.name(), "DeletedObjects")) {
+            // TODO: Do something with these
+        } else {
+            std::cerr << "Unknown root node: " << child.name() << endl;
+        }
+    }
 }
+
+//
+// Header
+//
+uint32_t kdbx2::signature1() const { return _pvt->signature1; }
+uint32_t kdbx2::signature2() const { return _pvt->signature2; }
+uint32_t kdbx2::file_version() const { return _pvt->file_version; }
+uint16_t kdbx2::file_version_minor() const { return _pvt->file_version & 0xFFFF; }
+uint16_t kdbx2::file_version_major() const { return static_cast<uint16_t>(_pvt->file_version >> 16); }
+const std::string& kdbx2::comment() const { return _pvt->comment; }
+const std::string& kdbx2::cipher_id() const { return _pvt->cipher_id; }
+uint32_t kdbx2::compression_flags() const { return _pvt->compression_flags; }
+uint64_t kdbx2::transform_rounds() const { return _pvt->transform_rounds; }
+uint32_t kdbx2::inner_random_stream_id() const { return _pvt->inner_random_stream_id; }
+
+//
+// Meta
+//
+const char* kdbx2::generator() const { return _pvt->meta.child("Generator").text().get(); }
+const char* kdbx2::header_hash() const { return _pvt->meta.child("HeaderHash").text().get(); }
+const char* kdbx2::database_name() const { return _pvt->meta.child("DatabaseName").text().get(); }
+const char* kdbx2::database_name_changed() const { return _pvt->meta.child("DatabaseNameChanged").text().get(); }
+const char* kdbx2::database_description() const { return _pvt->meta.child("DatabaseDescription").text().get(); }
+const char* kdbx2::database_description_changed() const { return _pvt->meta.child("DatabaseDescriptionChanged").text().get(); }
+const char* kdbx2::default_user_name() const { return _pvt->meta.child("DefaultUserName").text().get(); }
+const char* kdbx2::default_user_name_changed() const { return _pvt->meta.child("DefaultUserNameChanged").text().get(); }
+const char* kdbx2::maintenance_history_days() const { return _pvt->meta.child("MaintenanceHistoryDays").text().get(); }
+const char* kdbx2::color() const { return _pvt->meta.child("Color").text().get(); }
+const char* kdbx2::master_key_changed() const { return _pvt->meta.child("MasterKeyChanged").text().get(); }
+int kdbx2::master_key_change_rec() const { return _pvt->meta.child("MasterKeyChangeRec").text().as_int(); }
+int kdbx2::master_key_change_force() const { return _pvt->meta.child("MasterKeyChangeForce").text().as_int(); }
+bool kdbx2::recycle_bin_enabled() const { return _pvt->meta.child("RecycleBinEnabled").text().as_bool(); }
+const char* kdbx2::recycle_bin_uuid() const { return _pvt->meta.child("RecycleBinUUID").text().get(); }
+const char* kdbx2::recycle_bin_changed() const { return _pvt->meta.child("RecycleBinChanged").text().get(); }
+const char* kdbx2::entry_templates_group() const { return _pvt->meta.child("EntryTemplatesGroup").text().get(); }
+const char* kdbx2::entry_templates_group_changed() const { return _pvt->meta.child("EntryTemplatesGroupChanged").text().get(); }
+const char* kdbx2::history_max_items() const { return _pvt->meta.child("HistoryMaxItems").text().get(); }
+const char* kdbx2::history_max_size() const { return _pvt->meta.child("HistoryMaxSize").text().get(); }
+const char* kdbx2::last_selected_group() const { return _pvt->meta.child("LastSelectedGroup").text().get(); }
+const char* kdbx2::last_top_visible_group() const { return _pvt->meta.child("LastTopVisibleGroup").text().get(); }
+
+//
+// Groups
+//
+const std::vector<group>& kdbx2::groups() const { return _pvt->groups; }
 
 }
